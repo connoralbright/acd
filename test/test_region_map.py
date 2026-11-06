@@ -57,3 +57,58 @@ def test_modern_region_map_wins_legacy_length_collision():
     assert ExportL5x._parse_region_map(bytes(record)) == [
         (4, 1, 2, 3, bytes(record[0x4E:]))
     ]
+
+
+def _gap_exporter(rung_ids, region_map_rows, gaps):
+    """An ExportL5x with just the tables _repair_region_map_gaps reads."""
+    import sqlite3
+
+    exporter = ExportL5x.__new__(ExportL5x)
+    exporter._db = sqlite3.connect(":memory:")
+    exporter._cur = exporter._db.cursor()
+    exporter._cur.execute("CREATE TABLE rungs(object_id int, rung text, seq_number int)")
+    exporter._cur.execute(
+        "CREATE TABLE region_map(object_id int, parent_id int, unknown int, seq_no int, record BLOB NOT NULL)"
+    )
+    exporter._cur.executemany(
+        "INSERT INTO rungs VALUES (?, ?, 0)", [(oid, "NOP();") for oid in rung_ids]
+    )
+    exporter._cur.executemany(
+        "INSERT INTO region_map VALUES (?, ?, ?, ?, x'')", region_map_rows
+    )
+    exporter._pending_region_map_gaps = gaps
+    return exporter
+
+
+def _rung_at(exporter, parent_id, unknown):
+    exporter._cur.execute(
+        "SELECT object_id FROM region_map WHERE parent_id=? AND unknown=?",
+        (parent_id, unknown),
+    )
+    return exporter._cur.fetchone()
+
+
+def test_gap_neighbours_are_found_by_unknown_when_seq_no_is_unset():
+    unset = 0xFFFFFFFF
+    # On-disk rung order 100, 101, 102, 103; routine 7 lacks its rung at
+    # unknown=1 (record 101). 103 is an unrelated unclaimed rung, so a search
+    # over every unclaimed rung would be ambiguous.
+    exporter = _gap_exporter(
+        [100, 101, 102, 103],
+        [(100, 7, 0, unset), (102, 7, 2, unset)],
+        [(7, 1, unset)],
+    )
+    exporter._repair_region_map_gaps()
+    assert _rung_at(exporter, 7, 1) == (101,)
+
+
+def test_single_gap_takes_the_single_unclaimed_rung_appended_later():
+    # The missing rung's record was appended after its neighbours.
+    exporter = _gap_exporter([100, 102, 101], [(100, 7, 0, 0), (102, 7, 2, 2)], [(7, 1, 1)])
+    exporter._repair_region_map_gaps()
+    assert _rung_at(exporter, 7, 1) == (101,)
+
+    # Two unclaimed rungs and one gap: ambiguous, left alone.
+    exporter = _gap_exporter([100, 102, 101, 105], [(100, 7, 0, 0), (102, 7, 2, 2)], [(7, 1, 1)])
+    exporter._repair_region_map_gaps()
+    assert _rung_at(exporter, 7, 1) is None

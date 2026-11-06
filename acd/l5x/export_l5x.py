@@ -276,10 +276,18 @@ class ExportL5x:
         (SbRegion.Dat is read and inserted sequentially, and SQLite's
         implicit `rowid` tracks that insertion order). For the routine
         (parent_id) with the gap, every *other* rung of that routine already
-        has a resolved object_id and a known seq. If the gap's seq falls
-        between two already-resolved neighbours, the missing rung must be
-        whichever one sits between those neighbours in on-disk order -- so
-        if exactly one unclaimed rung qualifies, it's the answer.
+        has a resolved object_id. Its neighbours are the entries whose
+        `unknown` is one less and one more than the gap's: `unknown` is the
+        rung's position in the routine (RoutineBuilder orders rungs by it).
+        `seq_no` can't be used for this: on real projects it is 0xFFFFFFFF on
+        many entries, and then no neighbour is found. The
+        missing rung must be whichever one sits between those neighbours in
+        on-disk order -- so if exactly one unclaimed rung qualifies, it's the
+        answer.
+
+        A rung record that a later edit appended to the end of SbRegion.Dat
+        isn't between its neighbours. When the file has exactly one gap and
+        exactly one unclaimed rung record, that record is the rung.
         """
         if not getattr(self, "_pending_region_map_gaps", None):
             return
@@ -295,14 +303,15 @@ class ExportL5x:
 
         resolved = []
         unresolved = []
+        single_gap = len(self._pending_region_map_gaps) == 1
         for parent_id, unknown, seq in self._pending_region_map_gaps:
             self._cur.execute(
-                "SELECT object_id, seq_no FROM region_map WHERE parent_id=? ORDER BY seq_no",
+                "SELECT object_id, unknown FROM region_map WHERE parent_id=?",
                 (parent_id,),
             )
             siblings = self._cur.fetchall()
-            prev_obj = next((oid for oid, s in siblings if s == seq - 1), None)
-            next_obj = next((oid for oid, s in siblings if s == seq + 1), None)
+            prev_obj = next((oid for oid, u in siblings if u == unknown - 1), None)
+            next_obj = next((oid for oid, u in siblings if u == unknown + 1), None)
             prev_row = rung_rowid_by_object_id.get(prev_obj)
             next_row = rung_rowid_by_object_id.get(next_obj)
 
@@ -313,6 +322,12 @@ class ExportL5x:
                 and (prev_row is None or rowid > prev_row)
                 and (next_row is None or rowid < next_row)
             ]
+            if len(candidates) != 1 and single_gap:
+                candidates = [
+                    object_id
+                    for object_id in rung_rowid_by_object_id
+                    if object_id not in claimed
+                ]
 
             if len(candidates) == 1:
                 object_id = candidates[0]
